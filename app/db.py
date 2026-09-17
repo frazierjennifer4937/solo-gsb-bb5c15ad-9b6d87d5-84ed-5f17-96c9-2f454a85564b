@@ -66,6 +66,22 @@ def initialise() -> None:
             CREATE INDEX IF NOT EXISTS idx_events_stream_applied_seq
                 ON events (stream_id, applied, sequence);
 
+            -- One row per (source stream, fork_id): records the fork cut point
+            -- and the target stream that received the copied prefix. The pair
+            -- is the idempotency key for retried fork requests; target_stream_id
+            -- is unique so two forks can never land on the same target stream.
+            CREATE TABLE IF NOT EXISTS forks (
+                source_stream_id TEXT    NOT NULL,
+                fork_id          TEXT    NOT NULL,
+                target_stream_id TEXT    NOT NULL,
+                through_sequence INTEGER NOT NULL CHECK (through_sequence >= 0),
+                balance          INTEGER NOT NULL,
+                PRIMARY KEY (source_stream_id, fork_id),
+                UNIQUE (target_stream_id),
+                FOREIGN KEY (source_stream_id) REFERENCES streams(stream_id),
+                FOREIGN KEY (target_stream_id) REFERENCES streams(stream_id)
+            );
+
             -- One row per (stream, consumer): the consumption cursor plus the
             -- at-most-one outstanding claim lease. Lease columns are either all
             -- NULL (no lease) or all set together.

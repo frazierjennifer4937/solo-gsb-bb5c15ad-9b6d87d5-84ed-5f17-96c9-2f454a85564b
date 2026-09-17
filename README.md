@@ -21,6 +21,10 @@
   同一 token**，持 token 确认（ack）后游标原子推进；过期/旧 token 返回 `409`，
   租约到期后同批事件可被再次领取（at-least-once）。多个实例并发领取也只会存在
   一个有效租约。
+- **流分叉（fork）**：把源流 `[0, through_sequence)` 的**已应用**事件整体复制为
+  一个新的、可继续追加事件的目标流；`fork_id` 在同一源流下是幂等键，重试安全，
+  分叉记录、目标流和复制事件在同一个 `BEGIN IMMEDIATE` 事务内提交，并发请求不会
+  产生半成品。
 - 无外部账号、无外部依赖，`docker compose up --build` 一条命令启动。
 
 ## 一键启动
@@ -154,6 +158,51 @@ Content-Type: application/json
 
 不同 `consumer_id` 的游标与租约彼此独立；游标和租约都持久化在 SQLite 中。
 
+### 5. 分叉流（fork）
+
+```
+POST /streams/{stream_id}/forks
+Content-Type: application/json
+```
+
+请求体：
+
+| 字段               | 类型   | 约束                                   | 说明                                   |
+| ------------------ | ------ | -------------------------------------- | -------------------------------------- |
+| `fork_id`          | string | 非空，源流内唯一                       | 客户端分配的幂等键（重试键）           |
+| `target_stream_id` | string | 非空，必须是尚不存在的流               | 分叉创建的新流                         |
+| `through_sequence` | int    | `>= 0` 且 `<=` 源流的 `next_sequence`  | 独占上界，复制 `[0, through_sequence)` |
+
+把源流中序号位于 `[0, through_sequence)` 的**已应用**事件（`applied=1`）原样复制
+到目标流：目标流的事件 `applied=1`，`next_sequence = through_sequence`，
+`balance` 为这些事件 `delta` 之和。因缺号而暂存的事件（`pending_sequences`）不在
+连续前缀内，不会被复制。目标流创建后即可用普通的提交事件接口从
+`through_sequence` 继续追加。
+
+```json
+{
+  "source_stream_id": "acct-1",
+  "target_stream_id": "acct-1-backup",
+  "through_sequence": 2,
+  "balance": 300,
+  "next_sequence": 2
+}
+```
+
+- `201 Created`：分叉首次创建；
+- `200 OK`：同一 `(源流, fork_id)` 携带完全相同参数的幂等重试，返回既有分叉；
+- `409 Conflict`：
+  - `target_stream_exists`：目标流已存在（含其他分叉已占用该 `target_stream_id`）；
+  - `fork_replay_conflict`：同一 `fork_id` 重试时 `target_stream_id` 或
+    `through_sequence` 与首次不同；
+- `422 Unprocessable Entity`：`through_sequence` 超出 `[0, next_sequence]`
+  （`through_sequence_out_of_range`），或请求体字段校验失败；
+- `404 Not Found`：源流不存在（`stream_not_found`），此时不会创建任何目标流。
+
+分叉记录、目标流行与复制的事件在**同一个 `BEGIN IMMEDIATE` 事务**内写入：并发的
+相同 `fork_id` 请求只有一个创建分叉，其余全部拿到既有结果；并发的不同请求若争抢
+同一目标流，只有一个成功，其余得到 `409`，数据库中不会残留半成品目标流。
+
 ## 工作机制示例
 
 ```bash
@@ -239,12 +288,69 @@ curl -s -X POST localhost:8000/streams/acct-1/consumers/worker-a/claim \
 # 重新 claim 可再次拿到同批事件（新 token）。
 ```
 
+## 流分叉示例（fork）
+
+```bash
+# 接上文：acct-1 已有 3 个已应用事件（balance=350, next_sequence=3）。
+# 把 [0, 2) 的已应用事件复制到新流 acct-1-backup：
+curl -s -X POST localhost:8000/streams/acct-1/forks \
+  -H 'Content-Type: application/json' \
+  -d '{"fork_id":"daily-backup","target_stream_id":"acct-1-backup","through_sequence":2}'
+# 201:
+# {"source_stream_id":"acct-1","target_stream_id":"acct-1-backup",
+#  "through_sequence":2,"balance":300,"next_sequence":2}
+
+# 目标流可以继续追加事件（序号从 next_sequence=2 开始）
+curl -s -X POST localhost:8000/streams/acct-1-backup/events \
+  -H 'Content-Type: application/json' \
+  -d '{"event_id":"b-e2","sequence":2,"delta":10}'
+# 201 -> balance=310, next_sequence=3
+
+# 相同 fork_id + 相同参数重试：幂等，返回 200 与既有分叉（不会重复复制事件）
+curl -s -i -X POST localhost:8000/streams/acct-1/forks \
+  -H 'Content-Type: application/json' \
+  -d '{"fork_id":"daily-backup","target_stream_id":"acct-1-backup","through_sequence":2}'
+# HTTP/1.1 200 OK
+
+# 相同 fork_id 但参数不同：409 fork_replay_conflict
+curl -s -i -X POST localhost:8000/streams/acct-1/forks \
+  -H 'Content-Type: application/json' \
+  -d '{"fork_id":"daily-backup","target_stream_id":"acct-1-backup","through_sequence":3}'
+# HTTP/1.1 409
+
+# 目标流已存在：409 target_stream_exists
+curl -s -i -X POST localhost:8000/streams/acct-1/forks \
+  -H 'Content-Type: application/json' \
+  -d '{"fork_id":"another","target_stream_id":"acct-1-backup","through_sequence":1}'
+# HTTP/1.1 409
+
+# 上界超过源流的 next_sequence：422 through_sequence_out_of_range
+curl -s -i -X POST localhost:8000/streams/acct-1/forks \
+  -H 'Content-Type: application/json' \
+  -d '{"fork_id":"oob","target_stream_id":"acct-1-oob","through_sequence":99}'
+# HTTP/1.1 422
+
+# 源流不存在：404，且不会创建目标流
+curl -s -i -X POST localhost:8000/streams/unknown/forks \
+  -H 'Content-Type: application/json' \
+  -d '{"fork_id":"f","target_stream_id":"ghost","through_sequence":0}'
+# HTTP/1.1 404
+
+# through_sequence=0：创建一个空的、可从头追加的目标流
+curl -s -X POST localhost:8000/streams/acct-1/forks \
+  -H 'Content-Type: application/json' \
+  -d '{"fork_id":"empty","target_stream_id":"acct-1-empty","through_sequence":0}'
+# {"...","through_sequence":0,"balance":0,"next_sequence":0}
+```
+
 ## 数据模型
 
 ```text
 streams(stream_id PK, balance, next_sequence)
 events(stream_id, event_id, sequence, delta, applied,
        PK(stream_id, event_id), UNIQUE(stream_id, sequence))
+forks(source_stream_id, fork_id, target_stream_id, through_sequence, balance,
+      PK(source_stream_id, fork_id), UNIQUE(target_stream_id))
 consumers(stream_id, consumer_id, cursor_seq,
           lease_token, lease_expires_at, lease_from_seq, lease_to_seq,
           PK(stream_id, consumer_id))
@@ -283,6 +389,21 @@ consumers(stream_id, consumer_id, cursor_seq,
    `applied=1`，直到遇到缺号；
 5. 更新 `balance` 与 `next_sequence`，提交事务。
 
+分叉的处理同样在单个 `BEGIN IMMEDIATE` 事务内完成：
+
+1. 锁定并读取源流：不存在直接返回 `404`（事务内不做任何写入）；
+2. 按 `(source_stream_id, fork_id)` 查 `forks`：已存在则比对
+   `target_stream_id`/`through_sequence`，不一致返回 `409 fork_replay_conflict`，
+   一致则返回既有分叉（幂等重试，HTTP `200`）；
+3. 校验 `0 <= through_sequence <= 源流 next_sequence`，越界返回
+   `422 through_sequence_out_of_range`；
+4. 确认目标流不存在（存在则 `409 target_stream_exists`，`streams.stream_id` 的
+   主键与 `forks.target_stream_id` 的唯一约束共同兜底并发情况）；
+5. 取源流 `applied=1` 且序号在 `[0, through_sequence)` 的事件（按序号升序），
+   求和得到目标流初始 `balance`；插入目标流
+   `(balance=和, next_sequence=through_sequence)`，把事件以 `applied=1` 原样复制，
+   再写入 `forks` 分叉记录，统一提交——任一步失败整体回滚，不留半成品。
+
 ## 配置
 
 | 环境变量                | 默认值                | 说明                          |
@@ -302,12 +423,16 @@ pytest -q
 404、422 参数校验、大批量追赶以及 20 线程并发；消费者游标部分覆盖：领取连续批次、
 缺号时只返回已应用事件、租约内重复领取同批同 token、ack 推进游标、错误/旧/过期
 token 的三种 409、租约到期后同批重新领取、多消费者独立游标、空批次以及 20 线程
-并发只产生一个有效租约。
+并发只产生一个有效租约；流分叉部分覆盖：整段/部分/空前缀复制、暂存事件不复制、
+目标流可继续追加、源流 404、目标已存在 409、上界越界 422、相同参数重试 200 幂等、
+参数漂移 409、请求体 422，以及 20 线程并发（同一 `fork_id` 只产生一个分叉；
+不同 `fork_id` 争抢同一目标流时不留半成品）。
 
 仅用 Python 标准库验证核心归并算法（无需安装 FastAPI）：
 
 ```bash
 python3 verify_core.py
+python3 verify_forks.py
 ```
 
 ## 项目结构
@@ -318,11 +443,13 @@ python3 verify_core.py
 │   ├── __init__.py
 │   ├── main.py        # FastAPI 路由与请求/响应模型
 │   ├── repo.py        # 归并/追赶算法（纯 sqlite3，事务边界清晰）
+│   ├── forks.py       # 流分叉（fork）幂等事务
 │   ├── consumers.py   # 消费游标与 claim/ack 租约
 │   ├── db.py          # 连接管理、WAL、schema 初始化
 │   └── config.py      # 环境变量配置
 ├── tests/test_api.py
 ├── verify_core.py
+├── verify_forks.py
 ├── Dockerfile
 ├── docker-compose.yml
 ├── requirements.txt

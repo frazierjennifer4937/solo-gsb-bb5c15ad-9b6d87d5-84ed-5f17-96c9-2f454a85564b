@@ -370,3 +370,209 @@ def test_ack_of_empty_batch_advances_nothing(client):
     r = _ack(client, "c-empty", "worker", batch["lease_token"])
     assert r.status_code == 200
     assert r.json()["cursor"] == 0
+
+
+# --------------------------------------------------------------------------- #
+# Stream forking
+# --------------------------------------------------------------------------- #
+
+
+def _fork(client, source_id, fork_id, target_id, through):
+    return client.post(
+        f"/streams/{source_id}/forks",
+        json={
+            "fork_id": fork_id,
+            "target_stream_id": target_id,
+            "through_sequence": through,
+        },
+    )
+
+
+def _seed_for_fork(client, stream_id="f-src", deltas=(100, -30, 20, 10, 5)):
+    for seq, delta in enumerate(deltas):
+        assert _post(client, stream_id, f"{stream_id}-e{seq}", seq, delta).status_code in (
+            200,
+            201,
+        )
+
+
+def test_fork_copies_full_applied_prefix(client):
+    _seed_for_fork(client, "f-src-full")
+    r = _fork(client, "f-src-full", "fork-1", "f-dst", 5)
+    assert r.status_code == 201
+    assert r.json() == {
+        "source_stream_id": "f-src-full",
+        "target_stream_id": "f-dst",
+        "through_sequence": 5,
+        "balance": 105,
+        "next_sequence": 5,
+    }
+
+    state = client.get("/streams/f-dst").json()
+    assert state == {
+        "stream_id": "f-dst",
+        "balance": 105,
+        "next_sequence": 5,
+        "pending_sequences": [],
+    }
+    # The source is untouched.
+    assert client.get("/streams/f-src-full").json()["balance"] == 105
+
+
+def test_forked_stream_keeps_accepting_events(client):
+    _seed_for_fork(client, "f-src-append")
+    _fork(client, "f-src-append", "fork-1", "f-dst-append", 3)
+
+    r = _post(client, "f-dst-append", "f-dst-append-e3", 3, 7)
+    assert r.status_code == 201
+    body = r.json()["stream"]
+    assert body["next_sequence"] == 4
+    assert body["balance"] == 97  # 100 - 30 + 20 + 7
+
+
+def test_fork_partial_prefix(client):
+    _seed_for_fork(client, "f-src-part")
+    r = _fork(client, "f-src-part", "fork-part", "f-part", 2)
+    assert r.status_code == 201
+    body = r.json()
+    assert body["through_sequence"] == 2
+    assert body["balance"] == 70
+    assert body["next_sequence"] == 2
+    assert client.get("/streams/f-part").json()["pending_sequences"] == []
+
+
+def test_fork_zero_through_sequence_copies_nothing(client):
+    _seed_for_fork(client, "f-src-zero")
+    r = _fork(client, "f-src-zero", "fork-zero", "f-zero", 0)
+    assert r.status_code == 201
+    assert r.json()["balance"] == 0
+    assert r.json()["next_sequence"] == 0
+    state = client.get("/streams/f-zero").json()
+    assert state["balance"] == 0 and state["next_sequence"] == 0
+
+
+def test_fork_skips_pending_unapplied_events(client):
+    # Buffered pending events past the gap never enter the fork.
+    _post(client, "f-gap-src", "e1", 1, 200)
+    _post(client, "f-gap-src", "e2", 2, 50)
+    _post(client, "f-gap-src", "e0", 0, 100)  # catch-up -> next_sequence=3
+    _post(client, "f-gap-src", "e5", 5, 9)  # stays pending (gap at 3)
+
+    r = _fork(client, "f-gap-src", "g", "f-gap-dst", 3)
+    assert r.status_code == 201
+    body = r.json()
+    assert body["balance"] == 350 and body["next_sequence"] == 3
+    assert client.get("/streams/f-gap-dst").json()["pending_sequences"] == []
+
+
+def test_fork_on_unknown_source_returns_404(client):
+    r = _fork(client, "no-such-source", "g", "f-404-dst", 0)
+    assert r.status_code == 404
+    assert r.json()["detail"]["code"] == "stream_not_found"
+    # No target stream was created.
+    assert client.get("/streams/f-404-dst").status_code == 404
+
+
+def test_fork_into_existing_target_returns_409(client):
+    _seed_for_fork(client, "f-src-taken")
+    _post(client, "f-taken", "e0", 0, 1)
+    r = _fork(client, "f-src-taken", "g", "f-taken", 1)
+    assert r.status_code == 409
+    assert r.json()["detail"]["code"] == "target_stream_exists"
+
+
+def test_fork_through_sequence_out_of_range_returns_422(client):
+    _seed_for_fork(client, "f-src-range")
+    r = _fork(client, "f-src-range", "g-too-far", "f-too-far", 6)
+    assert r.status_code == 422
+    assert r.json()["detail"]["code"] == "through_sequence_out_of_range"
+    # The failed fork left nothing behind.
+    assert client.get("/streams/f-too-far").status_code == 404
+
+
+def test_fork_retry_with_same_parameters_is_idempotent(client):
+    _seed_for_fork(client, "f-src-retry1")
+    first = _fork(client, "f-src-retry1", "retry-fork", "f-retry", 4)
+    assert first.status_code == 201
+
+    second = _fork(client, "f-src-retry1", "retry-fork", "f-retry", 4)
+    assert second.status_code == 200
+    assert second.json() == first.json()
+
+    # Exactly one copy of each event exists in the target.
+    claim = _claim(client, "f-retry", "worker", 100).json()
+    assert [e["sequence"] for e in claim["events"]] == [0, 1, 2, 3]
+
+
+def test_fork_retry_with_different_parameters_returns_409(client):
+    _seed_for_fork(client, "f-src-retry2")
+    assert _fork(client, "f-src-retry2", "retry-fork", "f-retry2", 4).status_code == 201
+
+    r = _fork(client, "f-src-retry2", "retry-fork", "f-retry2", 2)
+    assert r.status_code == 409
+    assert r.json()["detail"]["code"] == "fork_replay_conflict"
+
+    r = _fork(client, "f-src-retry2", "retry-fork", "f-retry2-other", 4)
+    assert r.status_code == 409
+    assert r.json()["detail"]["code"] == "fork_replay_conflict"
+
+    # No extra streams/events were created by the clashing retries.
+    assert client.get("/streams/f-retry2-other").status_code == 404
+
+
+def test_fork_validation_rejects_bad_payloads(client):
+    _seed_for_fork(client, "f-src-val")
+    url = "/streams/f-src-val/forks"
+    assert client.post(url, json={"fork_id": "", "target_stream_id": "t", "through_sequence": 0}).status_code == 422
+    assert client.post(url, json={"fork_id": "g", "target_stream_id": "", "through_sequence": 0}).status_code == 422
+    assert client.post(url, json={"fork_id": "g", "target_stream_id": "t", "through_sequence": -1}).status_code == 422
+    assert client.post(url, json={"fork_id": "g", "target_stream_id": "t", "through_sequence": True}).status_code == 422
+    assert client.post(url, json={"fork_id": "g", "target_stream_id": "t"}).status_code == 422
+
+
+def test_concurrent_forks_one_idempotent_fork(client):
+    import threading
+
+    _seed_for_fork(client, "f-src-conc1")
+    statuses: list[int] = []
+
+    def do_fork():
+        r = _fork(client, "f-src-conc1", "concurrent-fork", "f-concurrent", 3)
+        statuses.append(r.status_code)
+
+    threads = [threading.Thread(target=do_fork) for _ in range(20)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert sorted(statuses) == [200] * 19 + [201]
+    state = client.get("/streams/f-concurrent").json()
+    assert state["next_sequence"] == 3 and state["balance"] == 90
+    claim = _claim(client, "f-concurrent", "worker", 100).json()
+    assert [e["sequence"] for e in claim["events"]] == [0, 1, 2]
+
+
+def test_concurrent_forks_distinct_ids_same_target_never_half_build(client):
+    import threading
+
+    _seed_for_fork(client, "f-src-conc2")
+    codes: list[str] = []
+
+    def do_fork(i):
+        r = _fork(client, "f-src-conc2", f"race-fork-{i}", "f-race2", 2)
+        if r.status_code != 201:
+            codes.append(r.json()["detail"]["code"])
+
+    threads = [threading.Thread(target=do_fork, args=(i,)) for i in range(20)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert len(codes) == 19
+    assert set(codes) == {"target_stream_exists"}
+    state = client.get("/streams/f-race2").json()
+    assert state["balance"] == 70 and state["next_sequence"] == 2
+    claim = _claim(client, "f-race2", "worker", 100).json()
+    assert [e["sequence"] for e in claim["events"]] == [0, 1]
