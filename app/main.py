@@ -104,6 +104,40 @@ class AckOut(BaseModel):
     cursor: int = Field(..., description="New cursor sequence (next event this consumer will receive)")
 
 
+class ForkIn(BaseModel):
+    fork_id: str = Field(..., min_length=1, description="Client-assigned idempotency key, unique within the source stream")
+    target_stream_id: str = Field(..., min_length=1, description="Stream created by the fork; must not already exist")
+    through_sequence: int = Field(
+        ..., ge=0, description="Exclusive upper bound; only events with sequence < this value are copied"
+    )
+
+    @field_validator("through_sequence", mode="before")
+    @classmethod
+    def _reject_bool(cls, value):
+        # In lax mode pydantic accepts bool as int; JSON booleans are not integers here.
+        if isinstance(value, bool):
+            raise ValueError("must be an integer, not a boolean")
+        return value
+
+    model_config = {
+        "json_schema_extra": {
+            "examples": [
+                {"fork_id": "fork-1", "target_stream_id": "acct-1-backup", "through_sequence": 10}
+            ]
+        }
+    }
+
+
+class ForkOut(BaseModel):
+    source_stream_id: str
+    fork_id: str
+    target_stream_id: str
+    through_sequence: int = Field(..., description="Exclusive upper bound of the copied prefix")
+    balance: int = Field(..., description="Initial balance of the target stream")
+    next_sequence: int = Field(..., description="Initial next_sequence of the target stream")
+    replayed: bool
+
+
 @app.get("/health", tags=["meta"])
 def health() -> dict[str, str]:
     return {"status": "ok"}
@@ -155,6 +189,41 @@ def get_stream(stream_id: str) -> StreamStateOut:
             detail={"code": "stream_not_found", "message": f"unknown stream {stream_id!r}"},
         )
     return StreamStateOut(**state.as_dict())
+
+
+@app.post(
+    "/streams/{stream_id}/forks",
+    response_model=ForkOut,
+    status_code=201,
+    responses={200: {"model": ForkOut, "description": "Idempotent retry returning the existing fork"}},
+    tags=["forks"],
+    summary="Fork a stream: copy its applied prefix into a new appendable stream",
+)
+def fork_stream(stream_id: str, body: ForkIn):
+    try:
+        result = repo.fork_stream(
+            stream_id, body.fork_id, body.target_stream_id, body.through_sequence
+        )
+    except repo.ConflictError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": exc.code, "message": exc.message},
+        )
+    except sqlite3.IntegrityError as exc:
+        # Defence in depth: the UNIQUE constraints map to a 409 as well.
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "integrity_conflict", "message": str(exc)},
+        )
+    if result is None:
+        raise HTTPException(
+            status_code=404,
+            detail={"code": "stream_not_found", "message": f"unknown stream {stream_id!r}"},
+        )
+
+    payload = ForkOut(**result.as_dict()).model_dump()
+    # Idempotent retries return 200; first-time forks return 201.
+    return JSONResponse(payload, status_code=200 if result.replayed else 201)
 
 
 @app.post(

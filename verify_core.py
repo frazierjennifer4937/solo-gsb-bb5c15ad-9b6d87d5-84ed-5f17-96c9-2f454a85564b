@@ -174,6 +174,101 @@ for t in threads:
 check("concurrent claims no errors", not lock_errors, str(lock_errors[:1]))
 check("concurrent claims one lease", len(tokens) == 20 and len(set(tokens)) == 1, str(set(tokens)))
 
+# 14. fork a stream: copy the applied prefix into an appendable target
+for seq in range(5):
+    repo.submit_event("s6", f"s6-e{seq}", seq, (seq + 1) * 10)  # balance 150
+repo.submit_event("s6", "s6-e7", 7, 700)  # buffered beyond a gap, never copied
+
+f = repo.fork_stream("s6", "fork-1", "s6-fork", 3)
+check("fork created", f is not None and not f.replayed
+      and f.through_sequence == 3 and f.balance == 60 and f.next_sequence == 3, str(f))
+dst = repo.get_stream_state("s6-fork")
+check("fork target state", dst.balance == 60 and dst.next_sequence == 3 and dst.pending_sequences == [], str(dst))
+
+# target is independently appendable; source is untouched
+s, _ = repo.submit_event("s6-fork", "dst-e3", 3, 7)
+check("fork target appendable", s.balance == 67 and s.next_sequence == 4, str(s))
+src = repo.get_stream_state("s6")
+check("fork source untouched", src.balance == 150 and src.next_sequence == 5 and src.pending_sequences == [7], str(src))
+
+# fork at 0 (empty) and at next_sequence (whole applied prefix, buffered 7 excluded)
+f0 = repo.fork_stream("s6", "fork-0", "s6-fork-empty", 0)
+check("fork at zero empty", f0.balance == 0 and f0.next_sequence == 0, str(f0))
+ff = repo.fork_stream("s6", "fork-full", "s6-fork-full", 5)
+check("fork at next_sequence", ff.balance == 150 and ff.next_sequence == 5, str(ff))
+check("fork full excludes buffered", repo.get_stream_state("s6-fork-full").pending_sequences == [])
+
+# unknown source -> None
+check("fork unknown source None", repo.fork_stream("nope", "f", "d", 0) is None)
+
+# out of range through_sequence -> 409
+try:
+    repo.fork_stream("s6", "fork-bad", "s6-bad", 6)
+    check("fork out of range -> 409", False)
+except repo.ConflictError as e:
+    check("fork out of range -> 409", e.code == "through_sequence_out_of_range", e.code)
+
+# existing target -> 409; target == source also 409
+try:
+    repo.fork_stream("s6", "fork-x", "s6-fork", 1)
+    check("fork existing target -> 409", False)
+except repo.ConflictError as e:
+    check("fork existing target -> 409", e.code == "target_stream_exists", e.code)
+try:
+    repo.fork_stream("s6", "fork-self", "s6", 1)
+    check("fork target==source -> 409", False)
+except repo.ConflictError as e:
+    check("fork target==source -> 409", e.code == "target_stream_exists", e.code)
+
+# retry same parameters is idempotent and returns the fork-point snapshot
+fr = repo.fork_stream("s6", "fork-1", "s6-fork", 3)
+check("fork retry idempotent", fr.replayed and fr.balance == 60 and fr.next_sequence == 3, str(fr))
+# retry with different parameters -> 409
+for params in (("s6-fork", 4), ("s6-other", 3)):
+    try:
+        repo.fork_stream("s6", "fork-1", params[0], params[1])
+        check("fork retry conflict -> 409", False)
+    except repo.ConflictError as e:
+        check("fork retry conflict -> 409", e.code == "fork_parameters_conflict", e.code)
+check("fork conflict created nothing", repo.get_stream_state("s6-other") is None)
+
+# concurrency: 20 distinct forks; exactly one success when sharing a target
+fork_errors = []
+def do_distinct_fork(i):
+    try:
+        repo.fork_stream("s6", f"fork-c{i}", f"s6-cfork-{i}", 3)
+    except Exception:
+        fork_errors.append(traceback.format_exc())
+
+threads = [threading.Thread(target=do_distinct_fork, args=(i,)) for i in range(20)]
+for t in threads:
+    t.start()
+for t in threads:
+    t.join()
+check("concurrent forks no errors", not fork_errors, str(fork_errors[:1]))
+for i in range(20):
+    d = repo.get_stream_state(f"s6-cfork-{i}")
+    check(f"concurrent fork {i} complete", d.balance == 60 and d.next_sequence == 3, str(d))
+
+shared = []
+def do_shared_fork(i):
+    try:
+        r = repo.fork_stream("s6", f"fork-s{i}", "s6-shared", 2)
+        shared.append(201 if not r.replayed else 200)
+    except repo.ConflictError:
+        shared.append(409)
+    except Exception:
+        shared.append(500)
+
+threads = [threading.Thread(target=do_shared_fork, args=(i,)) for i in range(20)]
+for t in threads:
+    t.start()
+for t in threads:
+    t.join()
+check("concurrent shared target one success", shared.count(201) == 1 and 500 not in shared, str(shared))
+d = repo.get_stream_state("s6-shared")
+check("shared target consistent", d.balance == 30 and d.next_sequence == 2, str(d))
+
 print()
 if failures:
     print(f"{len(failures)} FAILURES: {failures}")
